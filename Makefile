@@ -1,5 +1,5 @@
 ALL: boot
-	./boot test.ml
+	./boot ml.ml
 
 boot: boot.c
 	$(CC) -Wall -Werror -O2 -g -oboot boot.c

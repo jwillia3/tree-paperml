@@ -1,9 +1,15 @@
-let main =
-print $ foldl_self (+) [1,2,3,4]
-;print (
+infixr 9 .
+infixl 7 * / rem
+infixl 6 + - ^
+infixr 5 : ++
+infixl 4 == <> < > <= >=
+infixr 3 &&
+infixr 2 ||
+infixr 1 := +=
+infixl 0 <<
+infixr 0 $
 
-    case SOME 1
-    | NONE -> "BAD"
-    | SOME x -> ["GOOD", x]
-)
-; print (let [NONE] = [NONE] in "OK")
+datatype just_checking = JUST_CHECKING
+datatype (a) qwert = Q (a->int)
+
+let _ = 0

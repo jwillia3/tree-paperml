@@ -1,3 +1,7 @@
+#ifndef MAX_TUPLE
+#define MAX_TUPLE 1024
+#endif
+
 #define new(t,...)\
     ((t*) memcpy(malloc(sizeof(t)), &(t){__VA_ARGS__}, sizeof(t)))
 
@@ -29,26 +33,25 @@ typedef enum toktype {
     TEND, TINT, TSTRING, TLPAREN, TRPAREN, TLBRACE, TRBRACE,
     TCOMMA, TBACK, TSEMI, TID, TEQUAL, TIF, TTHEN, TELSE, TLET, TREC,
     TAND, TIN, TTRUE, TFALSE, TCASE, TBAR, TFN, TARROW, TINFIXL,
-    TINFIXR, TREF, TDEREF, TDATATYPE,
+    TINFIXR, TDEREF, TDATATYPE, TTYPING,
 } toktype;
 
 char *toks[] = {
     "end", "int", "string", "(", ")", "[", "]", ",", "`", ";", "id",
     "=", "if", "then", "else", "let", "rec", "and", "in",
     "true", "false", "case", "|", "fn", "->", "infixl", "infixr",
-    "ref", "!", "datatype", 0
+    "!", "datatype", "::", 0
 };
 
 struct value {
     enum {
-        NO_VALUE, NIL, UNIT, BOOLE, INT, STRING, LIST, REF, DATA, TUPLE, FN
+        NO_VALUE, NIL, UNIT, BOOLE, INT, STRING, LIST, DATA, TUPLE, FN
     } form;
     union {
         int _int;
         string *str;
         list *list;
         fn *fn;
-        value *ref;
         tuple *tuple;
         struct data *data;
     };
@@ -60,7 +63,7 @@ struct data { char *constr; value arg; };
 
 struct node {
     enum {
-        ELIT, EVAR, ECONS, EREF, EDEREF, ESEQ, EAPP, ETUPLE, EIF,
+        ELIT, EVAR, ECONS, EDEREF, ESEQ, EAPP, ETUPLE, EIF,
         ELET, ECASE, EFN,
     } form;
     location loc;
@@ -86,9 +89,9 @@ struct senv { char *id; value val; senv *next; };
 enum {
     OP_CONS, OP_EQUAL, OP_NOT_EQUAL, OP_LESS, OP_LESS_EQUAL,
     OP_GREATER, OP_GREATER_EQUAL, OP_ADD, OP_SUB, OP_MUL, OP_DIV,
-    OP_REM, OP_JOIN, OP_STRLEN, OP_CHAR_AT, OP_SUBSTR, OP_STARTS,
+    OP_REM, OP_JOIN, OP_SIZE, OP_CHAR_AT, OP_SUBSTR, OP_STARTS,
     OP_FIND_STR, OP_ORD, OP_CHR, OP_ASSIGN, OP_PR, OP_READ_FILE,
-    OP_WRITE_FILE,
+    OP_WRITE_FILE, OP_EXIT,
 };
 
 char    source[65536];
@@ -103,8 +106,9 @@ string  *interns[65536];
 int     ninterns;
 infix   *infixes;
 value   nil={NIL}, unit={UNIT}, _true={BOOLE,._int=1}, _false={BOOLE};
+value   none;
 value   single_char[256], empty_string, noval={NO_VALUE};
-char    *ignore;
+char    *ignore, *some_id, *ref_id;
 
 
 void _Noreturn fatal(location loc, char *msg, ...) {
@@ -156,7 +160,6 @@ string *intern(char *chars, int len) {
 #define elit(loc, x) node(ELIT, loc, .val=x)
 #define evar(loc, x) node(EVAR, loc, .id=x)
 #define econs(loc, hd, tl) node(ECONS, loc, .lhs=hd, .rhs=tl)
-#define eref(loc, e) node(EREF, loc, .ref=e)
 #define ederef(loc, e) node(EDEREF, loc, .ref=e)
 #define eseq(loc, a, b) node(ESEQ, loc, .lhs=a, .rhs=b)
 #define eapp(loc, f, x) node(EAPP, loc, .lhs=f, .rhs=x)
@@ -170,7 +173,6 @@ string *intern(char *chars, int len) {
 #define theint(x) value(INT, ._int=x)
 #define thestr(x) value(STRING, .str=x)
 #define thelist(x) value(LIST, .list=x)
-#define theref(x) value(REF, .ref=x)
 #define thedata(x) value(DATA, .data=x)
 #define thetup(x) value(TUPLE, .tuple=x)
 #define thefn(x) value(FN, .fn=x)
@@ -184,7 +186,6 @@ string *intern(char *chars, int len) {
 #define isint(x) (type_of(x) == INT)
 #define isstr(x) (type_of(x) == STRING)
 #define islist(x) (type_of(x) == LIST)
-#define isref(x) (type_of(x) == REF)
 #define isdata(x) (type_of(x) == DATA)
 #define isdataconstr(x) (isdata(x) && !datahasarg(x))
 #define istup(x) (type_of(x) == TUPLE)
@@ -195,7 +196,6 @@ string *intern(char *chars, int len) {
 #define intval(x) (x._int)
 #define strval(x) (x.str)
 #define listval(x) (x.list)
-#define refval(x) (x.ref)
 #define dataval(x) (x.data)
 #define tupval(x) (x.tuple)
 #define fnval(x) (x.fn)
@@ -219,6 +219,7 @@ string *intern(char *chars, int len) {
 // Value modifiers.
 #define tupsetn(x, n, y) (tupval(x)->xs[n] = y)
 #define fnsetenv(x, e) (fnval(x)->env = e)
+#define datasetarg(x, e) (dataval(x)->arg = e)
 
 // Structure constructors.
 #define cons(x, y) thelist(new(struct list, x, y))
@@ -227,11 +228,9 @@ string *intern(char *chars, int len) {
 #define newnative(par, env, remain, op)\
     thefn(new(struct fn, par, 0, env, remain, op))
 
-value newref(value x) {
-    value *ref = new(value);
-    *ref = x;
-    return theref(ref);
-}
+#define some(x) newdata(some_id, x)
+
+#define isref(x) (isdata(x) && dataconstr(x) == ref_id && datahasarg(x))
 
 value newtup(int len) {
     tuple *tup = malloc(sizeof *tup + len * sizeof *tup->xs);
@@ -254,7 +253,7 @@ bool equal(value x, value y) {
             if (!equal(hd(x), hd(y))) return false;
         return equal(x, y);
     }
-    if (isref(x)) return refval(x) == refval(y);
+    if (isref(x)) return dataval(x) == dataval(y); // Not compared by value.
     if (isdata(x)) return dataval(x) == dataval(y) ||
         (dataconstr(x) == dataconstr(y) && equal(dataarg(x), dataarg(y)));
     if (istup(x)) {
@@ -269,33 +268,60 @@ bool equal(value x, value y) {
     return false;
 }
 
-void prval(value x) {
+void prval(value x, bool repr) {
     if (isnil(x)) fputs("[]", stdout);
     else if (isunit(x)) fputs("()", stdout);
     else if (isbool(x)) fputs(boolval(x)? "true": "false", stdout);
     else if (isint(x)) printf("%d", intval(x));
-    else if (isstr(x)) fwrite(schars(x), 1, slen(x), stdout);
+    else if (isstr(x)) {
+        if (repr) {
+            char    *chars = schars(x);
+            int     len = slen(x);
+            int     base = 0;
+            char    *esc = 0;
+            putchar('"');
+            for (int i = 0; i < len; i++) {
+                switch (chars[i]) {
+                case '\0':      esc = "\\0"; break;
+                case '\a':      esc = "\\a"; break;
+                case '\b':      esc = "\\b"; break;
+                case '\033':    esc = "\\e"; break;
+                case '\n':      esc = "\\n"; break;
+                case '\r':      esc = "\\r"; break;
+                case '\t':      esc = "\\t"; break;
+                }
+                if (esc) {
+                    fwrite(chars + base, 1, i - base, stdout);
+                    fwrite(esc, 1, 2, stdout);
+                    base = i + 1;
+                }
+            }
+            if (base < len) fwrite(chars + base, 1, len - base, stdout);
+            putchar('"');
+        }
+        else
+            fwrite(schars(x), 1, slen(x), stdout);
+    }
     else if (islist(x)) {
         putchar('[');
         for (value i = x; islist(i); i = tl(i))
-            prval(hd(i)),
+            prval(hd(i), true),
             fputs(isnil(tl(i))? "]": ", ", stdout);
     }
-    else if (isref(x)) fputs("ref ", stdout), prval(*refval(x));
     else if (isdata(x)) {
         fputs(dataconstr(x), stdout);
-        if (datahasarg(x)) { putchar(' '); prval(dataarg(x)); }
+        if (datahasarg(x)) { putchar(' '); prval(dataarg(x), true); }
     }
     else if (istup(x)) {
         for (int i = 0; i < tuplen(x); i++)
             fputs(i? ", ": "(", stdout),
-            prval(tupn(x, i));
+            prval(tupn(x, i), true);
         putchar(')');
     }
     else if (isfn(x)) fputs("(fn)", stdout);
 }
 
-#define printval(x) (prval(x), puts(""))
+#define printval(x) (prval(x, true), puts(""))
 
 value join(location loc, value list) {
     int     len = 0;
@@ -367,13 +393,18 @@ toktype next(void) {
             }
             else if (*src != '\\') *t++ = *src++;
             else switch ((src += 2)[-1]) {
+            case 'a': *t++ = '\a'; break;
+            case 'b': *t++ = '\b'; break;
+            case 'e': *t++ = '\033'; break;
             case 'n': *t++ = '\n'; break;
+            case 'r': *t++ = '\r'; break;
+            case 't': *t++ = '\t'; break;
             default: *t++ = src[-1]; break;
             }
     }
 
     char *base = src, *symbol = "!$%&*+-./:<=>?@^|~";
-    while (isalnum(*src) || *src == '_') src++;
+    while (isalnum(*src) || *src == '_' || *src == '\'') src++;
     if (src == base) while (*src && strchr(symbol, *src)) src++;
     if (src == base) syntax("illegal token");
     tokstr = intern(base, src - base);
@@ -388,6 +419,7 @@ toktype next(void) {
 #define need(t) ((void) (want(t) || (syntax("need %s", toks[t]), false)))
 
 node *expr(void);
+node *aexpr(bool required);
 
 node *suffix(toktype t, node *get(void)) {
     node *x = get();
@@ -421,9 +453,17 @@ node *listexpr(void) {
 node *fnexpr(toktype delim) {
     if (want(delim)) return expr();
     location loc = get_loc();
-    char    *par = (need(TID), tokstr->chars);
+    node    *par = aexpr(true);
     node    *body = fnexpr(delim);
-    return efn(loc, par, body);
+
+    // Transform `fn pat -> body` to `fn NEW -> let pat = NEW in body`.
+    if (par->form != EVAR) {
+        node    *new_par = evar(par->loc, cstr("")); // ID will never conflict.
+        body = elet(par->loc, false, rules(par, new_par, 0), body);
+        par = new_par;
+    }
+
+    return efn(loc, par->id, body);
 }
 
 node *aexpr(bool required) {
@@ -435,11 +475,11 @@ node *aexpr(bool required) {
     if (want(TSTRING)) return elit(loc, thestr(tokstr));
     if (want(TID)) return evar(loc, tokstr->chars);
     if (want(TLPAREN)) {
-        node    *tmp[64];
+        node    *tmp[MAX_TUPLE];
         int     n = 0;
         do {
             if (peek(TRPAREN)) break;
-            if (n > sizeof tmp / sizeof *tmp) syntax("tuple too large");
+            if (n >= MAX_TUPLE) syntax("tuple too large");
             tmp[n++] = expr();
         } while (want(TCOMMA));
         need(TRPAREN);
@@ -450,7 +490,6 @@ node *aexpr(bool required) {
         return etuple(loc, n, xs);
     }
     if (want(TLBRACE)) return listexpr();
-    if (want(TREF)) return eref(loc, aexpr(true));
     if (want(TDEREF)) return ederef(loc, aexpr(true));
     if (want(TFN)) return fnexpr(TARROW);
     if (required) syntax("need expression");
@@ -489,16 +528,31 @@ node *iexpr(int level) {
     return lhs;
 }
 
+void type(void) {
+    if (want(TID)) { }
+    else if (want(TLPAREN)) {
+        do {
+            if (peek(TRPAREN)) break;
+            type();
+        } while (want(TCOMMA));
+        need(TRPAREN);
+    } else syntax("need type");
+
+    while (want(TID)) { }
+
+    if (want(TARROW)) type();
+}
+
 rules *dec(bool first) {
     if (!want(TAND) && !first) return 0;
     node    *lhs = aexpr(true);
-    return rules(lhs, fnexpr(TEQUAL), 0);
+    return rules(lhs, want(TEQUAL)? expr(): fnexpr(TEQUAL), 0);
 }
 
 rules *rule(bool first) {
     if (!want(TBAR)) return 0;
-    node    *lhs = suffix(TARROW, expr);
-    return rules(lhs, expr(), 0);
+    node    *lhs = expr();
+    return rules(lhs, (need(TARROW), expr()), 0);
 }
 
 node *expr(void) {
@@ -521,6 +575,8 @@ node *expr(void) {
         e = ecase(loc, val, rules);
     } else
         e = iexpr(0);
+
+    while (want(TTYPING)) type(); // Discard typing.
 
     if (want(TSEMI)) {
         loc = sloc; // Location of semicolon not of the next token.
@@ -546,18 +602,12 @@ node **program(node **lastp, senv **env) {
             lastp = &(*lastp)->let.body;
         }
         else if (want(TDATATYPE)) {
-            want(TID); need(TID); need(TEQUAL); want(TBAR);
+            if (want(TLPAREN)) { need(TID); need(TRPAREN); }
+            want(TID); need(TEQUAL); want(TBAR);
             do {
                 char *constr = (need(TID), tokstr->chars);
                 *env = senv(constr, newdata(constr, noval), *env);
-                if (want(TLPAREN)) {
-                    int level = 1;
-                    while (level)
-                        if (want(TLPAREN)) level++;
-                        else if (want(TRPAREN)) level--;
-                        else if (want(TEND)) syntax("type arg not closed");
-                        else next();
-                }
+                if (peek(TLPAREN)) type();
             } while (want(TBAR));
         }
         else
@@ -608,7 +658,6 @@ senv *link_pattern(node *e, senv *env) {
         return link_pattern(e->rhs, env);
 
     case ESEQ:
-    case EREF:
     case EDEREF:
     case EIF:
     case ELET:
@@ -645,7 +694,6 @@ void link_vars(node *e, senv *env) {
         link_vars(e->rhs, env);
         break;
 
-    case EREF:
     case EDEREF:
         link_vars(e->ref, env);
         break;
@@ -736,7 +784,7 @@ value operate(location loc, value x, env *env, int op) {
 
     case OP_JOIN:
         return join(loc, x);
-    case OP_STRLEN:
+    case OP_SIZE:
         ckstr(x);
         return theint(slen(x));
     case OP_CHAR_AT:
@@ -753,7 +801,7 @@ value operate(location loc, value x, env *env, int op) {
         j = intval(x);
         if (i < 0) i += slen(str);
         if (j < 0) j += slen(str) + 1;
-        if (i < 0 || i >= slen(str)) raise(loc, "out of bounds", env->val);
+        if (i < 0 || i > slen(str)) raise(loc, "out of bounds", env->val);
         if (j < 0 || j > slen(str)) raise(loc, "out of bounds", x);
         if (j < i) raise(loc, "indexes cross", x);
         if (i == j) return empty_string;
@@ -770,7 +818,8 @@ value operate(location loc, value x, env *env, int op) {
         if (i < 0) i += slen(env->next->val);
         if (i < 0 || i >= slen(env->next->val))
             raise(loc, "out of bounds", env->val);
-        return theint(find_string(strval(env->next->val), i, strval(x)));
+        j = find_string(strval(env->next->val), i, strval(x));
+        return j < 0? none : some(theint(j));
     case OP_ORD:
         ckstr(x);
         return theint((unsigned char) schars(x)[0]);
@@ -779,24 +828,24 @@ value operate(location loc, value x, env *env, int op) {
         return single_char[intval(x) % 256];
 
     case OP_ASSIGN:
-        ck(env->val, ref);
-        return *refval(env->val) = x;
+        if (!isref(env->val)) raise(loc, "not ref", env->val);
+        return datasetarg(env->val, x);
 
     case OP_PR:
-        prval(x);
+        prval(x, false);
         return x;
 
     case OP_READ_FILE:
         ckstr(x);
         file = fopen(schars(x), "rb");
-        if (!file) return _false;
+        if (!file) return none;
         fseek(file, 0, SEEK_END);
         len = ftell(file);
         rewind(file);
         str = thestr(newstr(0, len));
         fread(schars(str), 1, len, file);
         fclose(file);
-        return str;
+        return some(str);
 
     case OP_WRITE_FILE:
         ckstr(env->val); ckstr(x);
@@ -805,6 +854,10 @@ value operate(location loc, value x, env *env, int op) {
         fwrite(schars(x), 1, slen(x), file);
         fclose(file);
         return _true;
+
+    case OP_EXIT:
+        ckint(x);
+        exit(intval(x));
     }
 
     fatal(loc, "UNHANDLED OPERATION: %d", op);
@@ -841,7 +894,6 @@ env *bind_pattern(node *pat, value x, env *env) {
         if (dataconstr(pat->lhs->val) != dataconstr(x)) return 0;
         return bind_pattern(pat->rhs, dataarg(x), env);
 
-    case EREF:
     case EDEREF:
     case ESEQ:
     case EIF:
@@ -868,13 +920,10 @@ top:
             local = local->next;
         return local->val;
 
-    case EREF:
-        return newref(eval(e->ref, env));
-
     case EDEREF:
         x = eval(e->ref, env);
         if (!isref(x)) raise(e->loc, "not ref", x);
-        return *refval(x);
+        return dataarg(x);
 
     case ECONS:
         x = eval(e->lhs, env);
@@ -964,6 +1013,11 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 256; i++)
         single_char[i] = thestr(intern((char[]){i}, 1));
     ignore = cstr("_");
+    some_id = cstr("SOME");
+    ref_id = cstr("ref");
+    empty_string = thestr(intern("", 0));
+
+    none = newdata(cstr("NONE"), noval);
 
     senv *env = 0;
     env = senv(cstr(":"), newnative("", 0, 2, OP_CONS), env);
@@ -979,7 +1033,7 @@ int main(int argc, char **argv) {
     env = senv(cstr("/"), newnative("", 0, 2, OP_DIV), env);
     env = senv(cstr("rem"), newnative("", 0, 2, OP_REM), env);
     env = senv(cstr("join"), newnative("", 0, 1, OP_JOIN), env);
-    env = senv(cstr("strlen"), newnative("", 0, 1, OP_STRLEN), env);
+    env = senv(cstr("size"), newnative("", 0, 1, OP_SIZE), env);
     env = senv(cstr("char_at"), newnative("", 0, 2, OP_CHAR_AT), env);
     env = senv(cstr("substr"), newnative("", 0, 3, OP_SUBSTR), env);
     env = senv(cstr("starts_with"), newnative("", 0, 2, OP_STARTS), env);
@@ -990,6 +1044,7 @@ int main(int argc, char **argv) {
     env = senv(cstr("pr"), newnative("", 0, 1, OP_PR), env);
     env = senv(cstr("read_file"), newnative("", 0, 1, OP_READ_FILE), env);
     env = senv(cstr("write_file"), newnative("", 0, 2, OP_WRITE_FILE), env);
+    env = senv(cstr("exit"), newnative("", 0, 1, OP_EXIT), env);
 
     node    *e = 0, **lastp = &e;
     opensrc("boot.ml");
