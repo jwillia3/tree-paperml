@@ -70,6 +70,7 @@ let basis_constrs = [
 
 
 
+
 let loc_of expr =
     case expr
     | ELIT (loc, _) -> loc
@@ -93,23 +94,66 @@ let loc_of expr =
 let rec prune type =
     case type
     | TYPEVAR (_, ref NONE) -> type
-    | TYPEVAR (_, r) -> val_of (r := SOME (prune val_of (!r)))
+    | TYPEVAR (_, inst) ->
+        let (SOME type') = !inst in
+        let type'' = prune type' in
+        inst := SOME type'';
+        type''
     | _ -> type
 
 let rec occurs_in var type =
-    case prune type
-    | TYPEVAR (_, r') -> let (TYPEVAR (_, r)) = var in r == r'
+    let type = prune type in
+    case type
+    | TYPEVAR (_, inst') -> let (TYPEVAR (_, inst)) = var in inst == inst'
     | REGULAR (_) -> false
     | TYPECON (type', _) -> var `occurs_in type'
     | FNTYPE (par, ret) -> var `occurs_in par || var `occurs_in ret
     | TUPTYPE (items) -> any (occurs_in var) items
+
+let rec unifies a b =
+    let a = prune a in
+    let b = prune b in
+    case (a, b)
+    | (TYPEVAR (_, a'), _) ->
+        if a `occurs_in b then
+            a == b
+        else
+            a' := SOME b;
+            true
+    | (_, TYPEVAR (_, b')) -> unifies b a
+    | (REGULAR a', REGULAR b') -> a' == b'
+    | (TYPECON (a', a''), TYPECON (b', b'')) -> a'' == b'' && unifies a' b'
+    | (FNTYPE (a', a''), FNTYPE (b', b'')) -> unifies a' b' && unifies a'' b''
+    | (TUPTYPE a', TUPTYPE b') ->
+        same_length a' b' && all (uncurry unifies) (zip a' b')
+    | (_, _) -> false
+
+let fresh nongenerics type =
+    let swaps = ref [] in
+    let rec loop type =
+        let type = prune type in
+        case type
+        | TYPEVAR _ ->
+            if any (occurs_in type) nongenerics then type else substitute type
+        | REGULAR (_) -> type
+        | TYPECON (arg, id) -> typecon (loop arg) id
+        | FNTYPE (par, ret) -> fntype (loop par) (loop ret)
+        | TUPTYPE (items) -> tuptype (map loop items)
+    and substitute (TYPEVAR (_, inst)) =
+        for_option (lookup inst !swaps) identity (fn () -> create_new inst)
+    and create_new inst =
+        let new = typevar () in
+        swaps := (inst, new) : !swaps;
+        new
+    in loop type
 
 # Most type variables are created without names.
 # Even ones that are named must be renamed so no two typevars print the same.
 # E.g. `fn (x :: a) (y :: a) -> 0` should be typed `a -> b -> int`.
 let rename_type_vars types =
     let uid = ref 0 in
-    let rec get_vars seen type =
+    let rec
+    and get_vars seen type =
         case prune type
         | TYPEVAR (_, instance) ->
             for_option (lookup instance seen)
@@ -425,7 +469,7 @@ let parse tokens =
                     loop (eapp loc (eapp loc (evar loc id) lhs) rhs)
                 | SOME (":", (_, rhs_lvl)) ->
                     let rhs = advance (); iexpr rhs_lvl in
-                    loop (econs loc lhs rhs)
+                    loop (econs (loc_of lhs) lhs rhs) # This loc improves errs.
                 | SOME (_, (_, rhs_lvl)) ->
                     let id = advance () in
                     let rhs = iexpr rhs_lvl in
@@ -454,6 +498,7 @@ let parse tokens =
                   | [single] -> single
                   | list -> etup loc list)
         else if want "[" then
+            # TODO: IMPROVE LOCATION OF CONS TO BE ON `[` AND `,`.
             let list = csv expr "]" in
             let result =
                 foldr (fn hd tl -> econs (loc_of hd) hd tl)
@@ -474,8 +519,8 @@ let parse tokens =
             case par
             | EVAR (_, id) -> efn loc id body
             | _ ->
-                let new = evar (loc_of par) "" in
-                efn loc new (elet loc false [(par, new)] body)
+                let new = evar (loc_of par) "\\NEW\\" in
+                efn loc "\\NEW\\" (elet loc false [(par, new)] body)
         in
 
         if want delim then expr () else
@@ -516,7 +561,140 @@ let parse tokens =
     in
     program ()
 
+let check env expr =
+    let _nongenerics = ref [] in
+
+    let rec
+
+    and check env expr =
+        case expr
+        | ELIT (_, val) ->
+            type_val val
+
+        | EVAR (_, id) ->
+            for_option (lookup id env)
+                (fresh !_nongenerics)
+                (fn () -> fatal (loc_of expr) ("undefined: " ^ id))
+
+        | ETUP (_, items) ->
+            tuptype (map (check env) items)
+
+        | ECONS (_, lhs, rhs) ->
+            let lhs' = check env lhs in
+            let rhs' = check env rhs in
+            cons_type_check rhs lhs' rhs'
+
+        | EDEREF (_, body) ->
+            let body' = check env body in
+            unify body (typecon (typevar ()) "ref") body'
+
+        | EFN (_, par, body) ->
+            with_nongenerics fn () ->
+                let par' = typevar () in
+                let local = define_nongeneric env par par' in
+                let body' = check local body in
+                fntype par' body'
+
+        | EAPP (_, _, _) -> fatal (loc_of expr) "UNHANDLED"
+        | EIF (_, _, _, _) -> fatal (loc_of expr) "UNHANDLED"
+        | ELET (_, true, _, _) -> fatal (loc_of expr) "UNHANDLED"
+
+        | ELET (_, false, decs, body) ->
+            with_nongenerics fn () ->
+                let env' = foldl check_dec env decs in
+                check env' body
+
+        | ECASE (_, _, _) -> fatal (loc_of expr) "UNHANDLED"
+        | ETYPING (_, body, want) ->
+            unify body want (check env body)
+
+    and check_dec env (lhs, rhs) =
+        with_nongenerics fn () ->
+            let _local = ref env in
+            let rhs' = check env rhs in
+            let lhs' = check_pat _local lhs in
+            unify rhs lhs' rhs';
+            !_local
+
+    and check_pat _env expr =
+        case expr
+        | ELIT (_, val) ->
+            type_val val
+
+        | EVAR (_, "_") ->
+            typevar () `tap fn type -> _nongenerics := type : !_nongenerics
+
+        | EVAR (_, id) ->
+            typevar () `tap ref_define_nongeneric _env id
+
+        | ETUP (_, items) ->
+            tuptype (map (check_pat _env) items)
+
+        | ECONS (_, lhs, rhs) ->
+            let lhs' = check_pat _env lhs in
+            let rhs' = check_pat _env rhs in
+            cons_type_check rhs lhs' rhs'
+
+        | EDEREF (_, body) -> invalid_pattern expr
+        | EFN (_, _, _) -> invalid_pattern expr
+        | EAPP (_, _, _) -> invalid_pattern expr
+        | EIF (_, _, _, _) -> invalid_pattern expr
+        | ELET (_, _, _, _) -> invalid_pattern expr
+        | ECASE (_, _, _) -> invalid_pattern expr
+        | ETYPING (_, body, want) ->
+            unify body want (check_pat _env body)
+
+    and invalid_pattern offending_expr =
+         fatal (loc_of offending_expr) "invalid pattern"
+
+    and define_nongeneric env id type =
+        _nongenerics := type : !_nongenerics;
+        (id, type) : env
+
+    and ref_define_nongeneric _env id type =
+        _env := define_nongeneric !_env id type
+
+    and with_nongenerics block =
+        let old = !_nongenerics in
+        block () `tap fn _ -> _nongenerics := old
+
+    and type_val val =
+        case val
+        | NIL -> typecon (typevar ()) "list"
+        | BOOL _ -> bool_type
+        | INT _ -> int_type
+        | STRING _ -> string_type
+
+    # This does extra logic to print a nicer error.
+    and cons_type_check offending_expr want got =
+        case got
+        | TYPECON (got', "list") ->
+            unify offending_expr want got';
+            typecon want "list"
+        | _ ->
+            # This always fails. It just prints in a nicer way.
+            unify offending_expr (typecon want "list") got
+
+    and unify offending_expr want got =
+        if not (unifies want got) then
+            let [want, got] = rename_type_vars [want, got] in
+            let msg = join [
+                "type mismatch",
+                "\nwant: ", repr_type want,
+                "\ngot:  ", repr_type got] in
+            fatal (loc_of offending_expr) msg
+        else prune want
+
+    in check env expr
+
+
 let filename = "test.ml"
 let (SOME source) = read_file filename
 let tokens = scan filename source
-let (types, constrs, infixes, expr) = parse tokens
+let (types, constrs, infixes, program) = parse tokens
+let basis = basis_constrs
+let type = check basis program
+let main =
+    let [type] = rename_type_vars [type] in
+    pr ":: ";
+    print (repr_type type)

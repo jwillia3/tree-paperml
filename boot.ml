@@ -32,6 +32,8 @@ let += rx n = rx := !rx + n
 let fst (x, _) = x
 let snd (_, x) = x
 
+let tap x f = f x; x
+
 
 #
 #   Option

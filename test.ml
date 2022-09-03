@@ -10,6 +10,10 @@ infixl 0 <<
 infixr 0 $
 
 datatype just_checking = JUST_CHECKING
-datatype (a) qwert = Q (a->int)
 
-let _ = 0
+let _ =
+(
+    let f x = 1
+    and g x = (f, f)
+    in g
+) :: just_checking

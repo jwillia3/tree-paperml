@@ -57,7 +57,7 @@ struct value {
     };
 };
 struct list { value hd, tl; };
-struct fn { char *par; node *body; struct env *env; int remain, op; };
+struct fn { char *id, *par; node *body; struct env *env; int remain, op; };
 struct tuple { int len; value xs[]; };
 struct data { char *constr; value arg; };
 
@@ -73,7 +73,7 @@ struct node {
         struct { node *lhs, *rhs; };
         struct { node *a, *b, *c; } _if;
         struct { bool rec; rules *rules; node *body; } let;
-        struct { char *par; node *body; } fn;
+        struct { char *id, *par; node *body; } fn;
         struct { node *val; rules *rules; } _case;
         struct { int len; node **xs; } tuple;
         node *ref;
@@ -167,7 +167,7 @@ string *intern(char *chars, int len) {
 #define eif(loc, a, b, c) node(EIF, loc, ._if={a,b,c})
 #define elet(loc, rec, rules, body) node(ELET, loc, .let={rec, rules, body})
 #define ecase(loc, val, rules) node(ECASE, loc, ._case={val, rules})
-#define efn(loc, par, body) node(EFN, loc, .fn={par, body})
+#define efn(loc, id, par, body) node(EFN, loc, .fn={id, par, body})
 
 // Value constructors.
 #define theint(x) value(INT, ._int=x)
@@ -210,6 +210,7 @@ string *intern(char *chars, int len) {
 #define datahasarg(x) (!isnoval(dataarg(x)))
 #define tuplen(x) (tupval(x)->len)
 #define tupn(x, n) (tupval(x)->xs[n])
+#define fnname(x) (fnval(x)->id)
 #define fnpar(x) (fnval(x)->par)
 #define fnbody(x) (fnval(x)->body)
 #define fnenv(x) (fnval(x)->env)
@@ -224,9 +225,9 @@ string *intern(char *chars, int len) {
 // Structure constructors.
 #define cons(x, y) thelist(new(struct list, x, y))
 #define newdata(constr, arg) thedata(new(struct data, constr, arg))
-#define newfn(par, body, env) thefn(new(struct fn, par, body, env, 0, 0))
-#define newnative(par, env, remain, op)\
-    thefn(new(struct fn, par, 0, env, remain, op))
+#define newfn(id, par, body, env) thefn(new(struct fn, id, par, body, env,0,0))
+#define newnative(id, par, env, remain, op)\
+    thefn(new(struct fn, id, par, 0, env, remain, op))
 
 #define some(x) newdata(some_id, x)
 
@@ -318,7 +319,7 @@ void prval(value x, bool repr) {
             prval(tupn(x, i), true);
         putchar(')');
     }
-    else if (isfn(x)) fputs("(fn)", stdout);
+    else if (isfn(x)) fputs(fnname(x)? fnname(x): "(fn)", stdout);
 }
 
 #define printval(x) (prval(x, true), puts(""))
@@ -450,11 +451,11 @@ node *listexpr(void) {
     return econs(loc, hd, tl);
 }
 
-node *fnexpr(toktype delim) {
+node *fnexpr(char *name, toktype delim) {
     if (want(delim)) return expr();
     location loc = get_loc();
     node    *par = aexpr(true);
-    node    *body = fnexpr(delim);
+    node    *body = fnexpr(name, delim);
 
     // Transform `fn pat -> body` to `fn NEW -> let pat = NEW in body`.
     if (par->form != EVAR) {
@@ -463,7 +464,7 @@ node *fnexpr(toktype delim) {
         par = new_par;
     }
 
-    return efn(loc, par->id, body);
+    return efn(loc, name, par->id, body);
 }
 
 node *aexpr(bool required) {
@@ -491,7 +492,7 @@ node *aexpr(bool required) {
     }
     if (want(TLBRACE)) return listexpr();
     if (want(TDEREF)) return ederef(loc, aexpr(true));
-    if (want(TFN)) return fnexpr(TARROW);
+    if (want(TFN)) return fnexpr(0, TARROW);
     if (required) syntax("need expression");
     return 0;
 }
@@ -546,7 +547,8 @@ void type(void) {
 rules *dec(bool first) {
     if (!want(TAND) && !first) return 0;
     node    *lhs = aexpr(true);
-    return rules(lhs, want(TEQUAL)? expr(): fnexpr(TEQUAL), 0);
+    char    *id = lhs->form == EVAR? lhs->id: 0;
+    return rules(lhs, want(TEQUAL)? expr(): fnexpr(id, TEQUAL), 0);
 }
 
 rules *rule(bool first) {
@@ -950,7 +952,7 @@ top:
             return operate(e->loc, x, fnenv(f), fnop(f));
 
         if (!fnbody(f))
-            return newnative(fnpar(f), env(x, fnenv(f)),
+            return newnative(fnname(f), fnpar(f), env(x, fnenv(f)),
                 fnremain(f) - 1, fnop(f));
 
         env = env(x, fnenv(f));
@@ -996,7 +998,7 @@ top:
         raise(e->loc, "could not bind pattern", x);
 
     case EFN:
-        return newfn(e->fn.par, e->fn.body, env);
+        return newfn(e->fn.id, e->fn.par, e->fn.body, env);
     }
 
     fatal(e->loc, "UNHANDLED: %d", e->form);
@@ -1005,6 +1007,11 @@ top:
 
 env *senv_to_env(senv *in) {
     return in? env(in->val, senv_to_env(in->next)): 0;
+}
+
+senv *define_native(char *id, int arity, int op, senv *env) {
+    id = cstr(id);
+    return senv(id, newnative(id, "", 0, arity, op), env);
 }
 
 int main(int argc, char **argv) {
@@ -1020,31 +1027,31 @@ int main(int argc, char **argv) {
     none = newdata(cstr("NONE"), noval);
 
     senv *env = 0;
-    env = senv(cstr(":"), newnative("", 0, 2, OP_CONS), env);
-    env = senv(cstr("=="), newnative("", 0, 2, OP_EQUAL), env);
-    env = senv(cstr("<>"), newnative("", 0, 2, OP_NOT_EQUAL), env);
-    env = senv(cstr("<"), newnative("", 0, 2, OP_LESS), env);
-    env = senv(cstr("<="), newnative("", 0, 2, OP_LESS_EQUAL), env);
-    env = senv(cstr(">"), newnative("", 0, 2, OP_GREATER), env);
-    env = senv(cstr(">="), newnative("", 0, 2, OP_GREATER_EQUAL), env);
-    env = senv(cstr("+"), newnative("", 0, 2, OP_ADD), env);
-    env = senv(cstr("-"), newnative("", 0, 2, OP_SUB), env);
-    env = senv(cstr("*"), newnative("", 0, 2, OP_MUL), env);
-    env = senv(cstr("/"), newnative("", 0, 2, OP_DIV), env);
-    env = senv(cstr("rem"), newnative("", 0, 2, OP_REM), env);
-    env = senv(cstr("join"), newnative("", 0, 1, OP_JOIN), env);
-    env = senv(cstr("size"), newnative("", 0, 1, OP_SIZE), env);
-    env = senv(cstr("char_at"), newnative("", 0, 2, OP_CHAR_AT), env);
-    env = senv(cstr("substr"), newnative("", 0, 3, OP_SUBSTR), env);
-    env = senv(cstr("starts_with"), newnative("", 0, 2, OP_STARTS), env);
-    env = senv(cstr("find_string"), newnative("", 0, 3, OP_FIND_STR), env);
-    env = senv(cstr("ord"), newnative("", 0, 1, OP_ORD), env);
-    env = senv(cstr("chr"), newnative("", 0, 1, OP_CHR), env);
-    env = senv(cstr(":="), newnative("", 0, 2, OP_ASSIGN), env);
-    env = senv(cstr("pr"), newnative("", 0, 1, OP_PR), env);
-    env = senv(cstr("read_file"), newnative("", 0, 1, OP_READ_FILE), env);
-    env = senv(cstr("write_file"), newnative("", 0, 2, OP_WRITE_FILE), env);
-    env = senv(cstr("exit"), newnative("", 0, 1, OP_EXIT), env);
+    env = define_native(":", 2, OP_CONS, env);
+    env = define_native("==", 2, OP_EQUAL, env);
+    env = define_native("<>", 2, OP_NOT_EQUAL, env);
+    env = define_native("<", 2, OP_LESS, env);
+    env = define_native("<=", 2, OP_LESS_EQUAL, env);
+    env = define_native(">", 2, OP_GREATER, env);
+    env = define_native(">=", 2, OP_GREATER_EQUAL, env);
+    env = define_native("+", 2, OP_ADD, env);
+    env = define_native("-", 2, OP_SUB, env);
+    env = define_native("*", 2, OP_MUL, env);
+    env = define_native("/", 2, OP_DIV, env);
+    env = define_native("rem", 2, OP_REM, env);
+    env = define_native("join", 1, OP_JOIN, env);
+    env = define_native("size", 1, OP_SIZE, env);
+    env = define_native("char_at", 2, OP_CHAR_AT, env);
+    env = define_native("substr", 3, OP_SUBSTR, env);
+    env = define_native("starts_with", 2, OP_STARTS, env);
+    env = define_native("find_string", 3, OP_FIND_STR, env);
+    env = define_native("ord", 1, OP_ORD, env);
+    env = define_native("chr", 1, OP_CHR, env);
+    env = define_native(":=", 2, OP_ASSIGN, env);
+    env = define_native("pr", 1, OP_PR, env);
+    env = define_native("read_file", 1, OP_READ_FILE, env);
+    env = define_native("write_file", 2, OP_WRITE_FILE, env);
+    env = define_native("exit", 1, OP_EXIT, env);
 
     node    *e = 0, **lastp = &e;
     opensrc("boot.ml");
